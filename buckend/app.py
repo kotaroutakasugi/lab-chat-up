@@ -10,8 +10,17 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
+# --- 0. パス設定 ---
+# この app.py がある backend フォルダ
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+# プロジェクトルート lab-chatbot-up
+ROOT_DIR = os.path.dirname(BACKEND_DIR)
+# frontend フォルダ
+FRONTEND_DIR = os.path.join(ROOT_DIR, "frontend")
+
 # --- 1. 環境変数読み込み ---
-load_dotenv()
+# ローカル開発用（backend/.env を読む）。Render では無視される
+load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 app = FastAPI()
@@ -25,9 +34,9 @@ app.add_middleware(
 )
 
 # --- 3. RAG準備 ---
-INDEX_FILE = "index.faiss"
-META_FILE = "meta.json"
-DATA_DIR = "data"
+INDEX_FILE = os.path.join(BACKEND_DIR, "index.faiss")
+META_FILE = os.path.join(BACKEND_DIR, "meta.json")
+DATA_DIR = os.path.join(BACKEND_DIR, "data")
 
 if os.path.exists(INDEX_FILE) and os.path.exists(META_FILE):
     index = faiss.read_index(INDEX_FILE)
@@ -46,7 +55,8 @@ class ChatRequest(BaseModel):
 
 
 def retrieve(query, top_k=3):
-    if index is None: return ""
+    if index is None:
+        return ""
     vec = model.encode([query])
     D, I = index.search(vec, top_k)
     results = []
@@ -66,12 +76,19 @@ def retrieve(query, top_k=3):
 
 @app.get("/")
 def home():
-    return FileResponse("index.html")
+    """frontend/index.html を返す"""
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"error": "index.html not found"}
+
 
 @app.get("/akiyama.jpg")
 def get_image():
-    if os.path.exists("akiyama.jpg"):
-        return FileResponse("akiyama.jpg")
+    """frontend/akiyama.jpg を返す"""
+    img_path = os.path.join(FRONTEND_DIR, "akiyama.jpg")
+    if os.path.exists(img_path):
+        return FileResponse(img_path)
     else:
         return {"error": "Image not found"}
 
@@ -100,7 +117,7 @@ def chat(req: ChatRequest):
 
 #重要：質問候補の提案
 回答の最後に、その回答に関連して学生が次に聞きそうな「おすすめの質問」を3つ提案してください。
-回答本文とおすすめの質問は「---」という区切り線で分け、それぞれ改行して書いてください。
+回答本文とおすすめの質問は「---」という区切り線で分け、それぞて改行して書いてください。
 
 形式例:
 回答本文です。ここまでは普通に答えてください。
@@ -116,9 +133,11 @@ def chat(req: ChatRequest):
 {user_message}
 """
 
-    # ✅ 修正済みURL： v1beta で gemini-1.5-flash (サフィックスなし) を指定
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [
@@ -128,15 +147,14 @@ def chat(req: ChatRequest):
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=20)
-        
+
         if response.status_code != 200:
-            # エラー内容をコンソールに出力（デバッグ用）
             print(f"Gemini API Error: {response.status_code} - {response.text}")
             answer = "申し訳ありません。AIサーバーとの通信でエラーが発生しました。"
         else:
             data = response.json()
             answer = data["candidates"][0]["content"]["parts"][0]["text"]
-            
+
     except Exception as e:
         answer = "エラーが発生しました（サーバーログを確認してください）"
         print(f"Server Error Details: {e}")
