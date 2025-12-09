@@ -8,6 +8,7 @@ import json
 import faiss
 import numpy as np
 from dotenv import load_dotenv
+from functools import lru_cache
 
 # --- パス設定 ---
 BUCKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,10 +16,10 @@ ROOT_DIR = os.path.dirname(BUCKEND_DIR)
 FRONTEND_DIR = os.path.join(ROOT_DIR, "frontend")
 
 # --- 環境変数 ---
-load_dotenv(os.path.join(BUCKEND_DIR, ".env"))
+load_dotenv(os.path.join(BUCKEND_DIR, ".env"))  # ローカル用
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- FastAPI ---
+# --- FastAPI 本体 ---
 app = FastAPI()
 
 # --- CORS ---
@@ -29,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FAISS / metadata 読み込み ---
+# --- FAISS / メタデータ読み込み ---
 INDEX_PATH = os.path.join(BUCKEND_DIR, "index.faiss")
 META_PATH = os.path.join(BUCKEND_DIR, "meta.json")
 DATA_DIR = os.path.join(BUCKEND_DIR, "data")
@@ -38,56 +39,73 @@ if os.path.exists(INDEX_PATH) and os.path.exists(META_PATH):
     index = faiss.read_index(INDEX_PATH)
     with open(META_PATH, encoding="utf-8") as f:
         metas = json.load(f)
+    EMBED_DIM = index.d  # 埋め込み次元（ゼロベクトル用に保持）
 else:
     index = None
     metas = []
+    EMBED_DIM = 768  # 一応のデフォルト
     print("Warning: index.faiss or meta.json not found.")
 
 
-# --- Gemini Embedding API ---
+# --- Gemini Embedding API 設定 ---
 EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key="
-    + GEMINI_API_KEY
+    "https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent"
+    f"?key={GEMINI_API_KEY}"
 )
 
-def embed_text(text: str):
-    """Gemini API で埋め込み生成（超軽量）"""
+@lru_cache(maxsize=512)
+def embed_text_cached(text: str) -> np.ndarray:
+    """
+    質問文などの埋め込みを Gemini で取得。
+    lru_cache でキャッシュして、同じ質問なら API を再呼び出ししない。
+    """
+    if not GEMINI_API_KEY:
+        print("No GEMINI_API_KEY set for embeddings.")
+        return np.zeros((EMBED_DIM,), dtype="float32")
+
     payload = {
         "model": "text-embedding-004",
         "content": {"parts": [{"text": text}]},
     }
 
-    res = requests.post(EMBED_URL, json=payload)
-    data = res.json()
-
-    # 正しいキーは "values"
     try:
-        vec = data["embedding"]["values"]
-        return np.array(vec).astype("float32")
-    except KeyError:
-        print("Embedding Error in app.py:", data)
-        # 検索時に完全に落ちないように、とりあえずゼロベクトル返す
-        return np.zeros((768,), dtype="float32")
+        res = requests.post(EMBED_URL, json=payload, timeout=15)
+        data = res.json()
+
+        # 正常系：embedding.values
+        if "embedding" in data and "values" in data["embedding"]:
+            vec = data["embedding"]["values"]
+            return np.array(vec, dtype="float32")
+
+        # エラー系：ログに内容を出しておく
+        print("Embedding API error response:", data)
+        return np.zeros((EMBED_DIM,), dtype="float32")
+
+    except Exception as e:
+        print("Embedding API call failed:", e)
+        return np.zeros((EMBED_DIM,), dtype="float32")
 
 
-
-# --- ベクトル検索 ---
-def retrieve(query, top_k=3):
+# --- ベクトル検索（RAG） ---
+def retrieve(query: str, top_k: int = 3) -> str:
+    """質問文から近いテキストを FAISS で検索"""
     if index is None:
         return ""
 
-    vec = embed_text(query).reshape(1, -1)
+    vec = embed_text_cached(query).reshape(1, -1)
     D, I = index.search(vec, top_k)
 
     results = []
     for idx in I[0]:
         if 0 <= idx < len(metas):
             fname = metas[idx]["source"]
+            path = os.path.join(DATA_DIR, fname)
             try:
-                with open(os.path.join(DATA_DIR, fname), encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     content = f.read()
                 results.append(f"[{fname}]\n{content}")
-            except:
+            except Exception as e:
+                print(f"Error reading {fname}:", e)
                 continue
 
     return "\n\n".join(results)
@@ -98,7 +116,7 @@ class ChatRequest(BaseModel):
     message: str
 
 
-# --- ルート（index.html） ---
+# --- ルート（フロント配信） ---
 @app.get("/")
 def home():
     html_path = os.path.join(FRONTEND_DIR, "index.html")
@@ -107,7 +125,6 @@ def home():
     return {"error": "index.html not found"}
 
 
-# --- 画像提供 ---
 @app.get("/akiyama.jpg")
 def get_image():
     img_path = os.path.join(FRONTEND_DIR, "akiyama.jpg")
@@ -116,11 +133,53 @@ def get_image():
     return {"error": "Image not found"}
 
 
+# --- Gemini 本文生成呼び出し ---
+def call_gemini_chat(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "GEMINI_API_KEY が設定されていないため、回答を生成できません。"
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1/models/"
+        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
+    }
+
+    try:
+        res = requests.post(url, json=payload, timeout=20)
+
+        # レート制限・課金関連のエラーを丁寧に処理
+        if res.status_code == 429:
+            print("Gemini API Error 429:", res.text)
+            return (
+                "現在、Gemini API の利用上限に達しています。\n"
+                "しばらく時間をおいてから、もう一度お試しください。"
+            )
+
+        if res.status_code != 200:
+            print("Gemini API Error:", res.status_code, res.text)
+            return (
+                "AIサーバーとの通信でエラーが発生しました。\n"
+                "時間をおいて再度お試しください。"
+            )
+
+        data = res.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    except Exception as e:
+        print("Gemini chat call failed:", e)
+        return "エラーが発生しました（サーバーログを確認してください）。"
+
+
 # --- チャットAPI ---
 @app.post("/chat")
 def chat(req: ChatRequest):
-    query = req.message
-    context = retrieve(query, top_k=5)
+    user_message = req.message
+    context = retrieve(user_message, top_k=5)
 
     prompt = f"""
 あなたはスマートICTソリューション研究室の教授「秋山康智（あきやま こうじ）」です。
@@ -145,30 +204,8 @@ def chat(req: ChatRequest):
 {context}
 
 #質問:
-{query}
+{user_message}
 """
 
-    # Gemini Chat API
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-
-    payload = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ]
-    }
-
-    try:
-        res = requests.post(url, json=payload, timeout=20)
-
-        if res.status_code != 200:
-            print("Gemini API Error:", res.status_code, res.text)
-            return {"answer": "AIサーバーとの通信でエラーが発生しました。"}
-
-        data = res.json()
-        answer = data["candidates"][0]["content"]["parts"][0]["text"]
-
-    except Exception as e:
-        print("Server Error:", e)
-        return {"answer": "エラーが発生しました（サーバーログを確認してください）。"}
-
+    answer = call_gemini_chat(prompt)
     return {"answer": answer}
