@@ -1,36 +1,79 @@
 import os
 import json
-from sentence_transformers import SentenceTransformer
 import faiss
+import numpy as np
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
 
 DATA_DIR = "data"
-INDEX_FILE = "index.faiss"
-META_FILE = "meta.json"
+OUTPUT_INDEX = "index.faiss"
+OUTPUT_META = "meta.json"
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key=" 
+    + API_KEY
+)
 
-documents = []
-metas = []
 
-for fname in os.listdir(DATA_DIR):
-    if fname.endswith(".txt") or fname.endswith(".md"):
+def embed_text(text: str):
+    payload = {
+        "model": "text-embedding-004",
+        "content": {"parts": [{"text": text}]},
+    }
+
+    res = requests.post(EMBED_URL, json=payload)
+    data = res.json()
+
+    # デバッグ用に表示（必要なら残してOK）
+    print("\n--- EMBEDDING RESPONSE ---")
+    print(data)
+    print("---------------------------\n")
+
+    # 正しいキーは "values"
+    try:
+        vec = data["embedding"]["values"]
+        return np.array(vec).astype("float32")
+    except KeyError:
+        print("Embedding Error:", data)
+        raise ValueError("Embedding failed. Check the API response.")
+
+
+
+
+def main():
+    files = os.listdir(DATA_DIR)
+    vectors = []
+    metas = []
+
+    for fname in files:
         path = os.path.join(DATA_DIR, fname)
-        with open(path, encoding="utf-8") as f:
-            content = f.read().split("\n\n")  # 段落ごとに分割
-            for paragraph in content:
-                paragraph = paragraph.strip()
-                if paragraph:
-                    documents.append(paragraph)
-                    metas.append({"source": fname})
 
-print(f"Encoding {len(documents)} documents...")
-embeddings = model.encode(documents, convert_to_numpy=True)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except:
+            continue
 
-index = faiss.IndexFlatL2(embeddings.shape[1])
-index.add(embeddings)
-faiss.write_index(index, INDEX_FILE)
+        print(f"Embedding {fname}...")
+        vec = embed_text(text)
+        vectors.append(vec)
+        metas.append({"source": fname})
 
-with open(META_FILE, "w", encoding="utf-8") as f:
-    json.dump(metas, f, ensure_ascii=False, indent=2)
+    # FAISS index 作成
+    dim = len(vectors[0])
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(vectors))
 
-print("✅ index.faiss と meta.json を生成しました。")
+    faiss.write_index(index, OUTPUT_INDEX)
+
+    with open(OUTPUT_META, "w", encoding="utf-8") as f:
+        json.dump(metas, f, ensure_ascii=False, indent=2)
+
+    print("FAISS index & meta.json created!")
+
+
+if __name__ == "__main__":
+    main()
